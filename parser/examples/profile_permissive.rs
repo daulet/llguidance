@@ -8,8 +8,7 @@ use llguidance::{
     Matcher, ParserFactory,
 };
 
-const DEFAULT_BENCH_TOKENIZER: &str = "benches/data/llama3_tokenizer.json";
-const DEFAULT_BENCH_TOKENIZER_ALT: &str = "parser/benches/data/llama3_tokenizer.json";
+const BENCH_TOKENIZER_DEFAULT_REL: &str = "benches/data/llama3_tokenizer.json";
 const BENCH_TOKENIZER_ENV: &str = "LLGUIDANCE_BENCH_TOKENIZER";
 #[cfg(feature = "mask_cache")]
 const MASK_CACHE_LABEL: &str = "cache_on";
@@ -19,21 +18,36 @@ const MASK_CACHE_LABEL: &str = "cache_off";
 #[derive(Clone, Copy)]
 struct ProfileCase {
     name: &'static str,
-    regex: &'static str,
+    grammar: GrammarSpec,
     prefix: &'static [u8],
     forbidden_byte: Option<u8>,
 }
 
-const CASES: [ProfileCase; 2] = [
+#[derive(Clone, Copy)]
+enum GrammarSpec {
+    Regex(&'static str),
+    Lark(&'static str),
+}
+
+const HORIZON_LARK: &str = r#"start: text "x"
+text[max_tokens=8192, stop="x"]: /[^x]*/"#;
+
+const CASES: [ProfileCase; 3] = [
     ProfileCase {
         name: "dot_star",
-        regex: ".*",
+        grammar: GrammarSpec::Regex(".*"),
         prefix: b"",
         forbidden_byte: None,
     },
     ProfileCase {
         name: "not_x_then_x",
-        regex: "[^x]*x",
+        grammar: GrammarSpec::Regex("[^x]*x"),
+        prefix: b"aaaaaaaaaaaaaaaa",
+        forbidden_byte: Some(b'x'),
+    },
+    ProfileCase {
+        name: "horizon_not_x_then_x",
+        grammar: GrammarSpec::Lark(HORIZON_LARK),
         prefix: b"aaaaaaaaaaaaaaaa",
         forbidden_byte: Some(b'x'),
     },
@@ -80,12 +94,13 @@ fn bench_tokenizer_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    let default = PathBuf::from(DEFAULT_BENCH_TOKENIZER);
-    if default.exists() {
-        return default;
+    let manifest_default =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(BENCH_TOKENIZER_DEFAULT_REL);
+    if manifest_default.exists() {
+        return manifest_default;
     }
 
-    PathBuf::from(DEFAULT_BENCH_TOKENIZER_ALT)
+    PathBuf::from(BENCH_TOKENIZER_DEFAULT_REL)
 }
 
 fn load_tok_env(path: &PathBuf) -> Result<TokEnv> {
@@ -121,6 +136,19 @@ fn regex_matcher_at_prefix(
     factory.quiet();
     let perf_counters = factory.perf_counters();
     let grammar = TopLevelGrammar::from_regex(regex);
+    let mut matcher = Matcher::new(factory.create_parser(grammar));
+    consume_prefix_bytes(&mut matcher, tok_env, prefix)?;
+    Ok((matcher, perf_counters))
+}
+
+fn grammar_matcher_at_prefix(
+    tok_env: &TokEnv,
+    grammar: TopLevelGrammar,
+    prefix: &[u8],
+) -> Result<(Matcher, Arc<ParserPerfCounters>)> {
+    let mut factory = ParserFactory::new_simple(tok_env)?;
+    factory.quiet();
+    let perf_counters = factory.perf_counters();
     let mut matcher = Matcher::new(factory.create_parser(grammar));
     consume_prefix_bytes(&mut matcher, tok_env, prefix)?;
     Ok((matcher, perf_counters))
@@ -192,7 +220,14 @@ fn run_case(
     measure_steps: usize,
 ) -> Result<()> {
     let vocab_size = tok_env.tok_trie().vocab_size();
-    let (mut matcher, perf_counters) = regex_matcher_at_prefix(tok_env, case.regex, case.prefix)?;
+    let (mut matcher, perf_counters) = match case.grammar {
+        GrammarSpec::Regex(regex) => regex_matcher_at_prefix(tok_env, regex, case.prefix)?,
+        GrammarSpec::Lark(lark) => grammar_matcher_at_prefix(
+            tok_env,
+            TopLevelGrammar::from_lark(lark.to_string()),
+            case.prefix,
+        )?,
+    };
     let first_mask = matcher.compute_mask()?;
     let target_token = pick_loop_token(tok_env, &first_mask, case.forbidden_byte);
 
@@ -246,12 +281,27 @@ fn run_case(
     let other_us = total_mask_us.saturating_sub(accounted_us);
     let target_bytes = tok_env.tok_trie().token(target_token);
     let target_dbg = String::from_utf8_lossy(target_bytes);
+    let grammar_label = match case.grammar {
+        GrammarSpec::Regex(rx) => format!("regex={rx:?}"),
+        GrammarSpec::Lark(_) => "grammar=lark(max_tokens horizon)".to_string(),
+    };
+    let estimated_cache_hit_ratio = if t_compute_mask.calls == 0 {
+        0.0
+    } else {
+        ((t_compute_mask.calls.saturating_sub(t_compute_bias.calls)) as f64)
+            / (t_compute_mask.calls as f64)
+    };
+    let cache_eligibility_ratio = if t_compute_mask.calls == 0 {
+        0.0
+    } else {
+        (t_mask_cache_key.calls as f64) / (t_compute_mask.calls as f64)
+    };
 
     println!();
     println!(
-        "case={} regex={:?} prefix_len={} vocab={}",
+        "case={} {} prefix_len={} vocab={}",
         case.name,
-        case.regex,
+        grammar_label,
         case.prefix.len(),
         vocab_size
     );
@@ -312,6 +362,10 @@ fn run_case(
         } else {
             (t_compute_bias.calls as f64) / (t_compute_mask.calls as f64)
         }
+    );
+    println!(
+        "cache_counters: estimated_hit_ratio={:.3} key_calls_per_step={:.3}",
+        estimated_cache_hit_ratio, cache_eligibility_ratio
     );
     println!(
         "parser_step_avg: compute_time_us={:.2} lexer_cost={:.2} all_items={:.2} trie_nodes_walked={:.2} rows={:.2} cached_rows={:.2}",

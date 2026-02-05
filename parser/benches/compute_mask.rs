@@ -10,8 +10,7 @@ use llguidance::{
 };
 
 const BLOG_SCHEMA_JSON: &str = include_str!("../../sample_parser/data/blog.schema.json");
-const DEFAULT_BENCH_TOKENIZER: &str = "benches/data/llama3_tokenizer.json";
-const DEFAULT_BENCH_TOKENIZER_ALT: &str = "parser/benches/data/llama3_tokenizer.json"; // TODO fix this
+const BENCH_TOKENIZER_DEFAULT_REL: &str = "benches/data/llama3_tokenizer.json";
 const BENCH_TOKENIZER_ENV: &str = "LLGUIDANCE_BENCH_TOKENIZER";
 #[cfg(feature = "mask_cache")]
 const MASK_CACHE_LABEL: &str = "cache_on";
@@ -102,12 +101,13 @@ fn bench_tokenizer_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    let default = PathBuf::from(DEFAULT_BENCH_TOKENIZER);
-    if default.exists() {
-        return default;
+    let manifest_default =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(BENCH_TOKENIZER_DEFAULT_REL);
+    if manifest_default.exists() {
+        return manifest_default;
     }
 
-    PathBuf::from(DEFAULT_BENCH_TOKENIZER_ALT)
+    PathBuf::from(BENCH_TOKENIZER_DEFAULT_REL)
 }
 
 fn real_tok_env() -> Option<TokEnv> {

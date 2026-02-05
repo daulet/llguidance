@@ -1,7 +1,5 @@
 use std::{fmt::Display, hint::black_box, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
-#[cfg(feature = "mask_cache")]
-use crate::earley::MaskCacheKeyDebug;
 use crate::{
     api::{GrammarInit, ParserLimits, StopReason},
     earley::{BiasComputer, Parser, ParserError, ParserStats},
@@ -110,8 +108,6 @@ pub struct TokenParser {
     mask_cache_cfg_only_verify_rate: u32,
     #[cfg(feature = "mask_cache")]
     mask_cache_cfg_only_verify_state: u64,
-    #[cfg(feature = "mask_cache")]
-    prev_mask_cache_key_debug: Option<MaskCacheKeyDebug>,
 
     // tokens currently in KV cache
     llm_tokens: Vec<TokenId>,
@@ -216,8 +212,6 @@ impl TokenParser {
             mask_cache_cfg_only_verify_rate,
             #[cfg(feature = "mask_cache")]
             mask_cache_cfg_only_verify_state: 0x9E37_79B9_7F4A_7C15,
-            #[cfg(feature = "mask_cache")]
-            prev_mask_cache_key_debug: None,
             parser,
             dbg_grammar: String::new(),
             eos_token,
@@ -527,11 +521,10 @@ impl TokenParser {
         self.mask_cache_cfg_only_key = false;
         self.mask_cache_cfg_only_verify = false;
         self.mask_cache = MaskCache::default();
-        self.prev_mask_cache_key_debug = None;
     }
 
     #[cfg(feature = "mask_cache")]
-    fn maybe_log_mask_cache_lookup_simple(&mut self, key: u64, hit: bool, cache_size: usize) {
+    fn maybe_log_mask_cache_lookup(&mut self, key: u64, hit: bool, cache_size: usize) {
         if !self.mask_cache_debug_enabled || self.mask_cache_debug_remaining == 0 {
             return;
         }
@@ -550,73 +543,6 @@ impl TokenParser {
     }
 
     #[cfg(feature = "mask_cache")]
-    fn maybe_log_mask_cache_lookup(
-        &mut self,
-        key_dbg: &MaskCacheKeyDebug,
-        hit: bool,
-        cache_size: usize,
-    ) {
-        if !self.mask_cache_debug_enabled || self.mask_cache_debug_remaining == 0 {
-            return;
-        }
-        self.mask_cache_debug_remaining -= 1;
-
-        let mut changes = Vec::new();
-        if let Some(prev) = &self.prev_mask_cache_key_debug {
-            macro_rules! diff {
-                ($field:ident) => {
-                    if prev.$field != key_dbg.$field {
-                        changes.push(format!(
-                            "{}:{:?}->{:?}",
-                            stringify!($field),
-                            prev.$field,
-                            key_dbg.$field
-                        ));
-                    }
-                };
-            }
-            diff!(key);
-            diff!(prefix_hash);
-            diff!(lexer_stack_top_eos);
-            diff!(top_lexer_state);
-            diff!(top_byte);
-            diff!(row_lexer_start_state);
-            diff!(row_lexeme_tag);
-            diff!(row_lexeme_value);
-            diff!(row_num_items);
-            diff!(row_items_hash);
-            diff!(row_min_rel_start);
-            diff!(row_max_rel_start);
-            diff!(row_item_args_hash);
-            diff!(grammar_depth);
-            diff!(grammar_hash);
-            diff!(grammar_finite_horizons);
-            diff!(lexer_suffix_len);
-            diff!(lexer_suffix_hash);
-        } else {
-            changes.push("first_observation".to_string());
-        }
-
-        let changed = if changes.is_empty() {
-            "none".to_string()
-        } else {
-            changes.join(", ")
-        };
-
-        eprintln!(
-            "mask_cache_key[lookup] {} mode=full cache_size={} key={} token_idx={} prefix_len={} changed={}",
-            if hit { "hit" } else { "miss" },
-            cache_size,
-            key_dbg.key,
-            key_dbg.token_idx,
-            key_dbg.prefix_len,
-            changed
-        );
-
-        self.prev_mask_cache_key_debug = Some(key_dbg.clone());
-    }
-
-    #[cfg(feature = "mask_cache")]
     fn mask_cache_debug_limit_from_env(default: usize) -> usize {
         std::env::var(MASK_CACHE_DEBUG_LIMIT_ENV)
             .ok()
@@ -625,27 +551,9 @@ impl TokenParser {
     }
 
     #[cfg(feature = "mask_cache")]
-    fn get_cached_mask(&mut self, token_prefix: &[u8]) -> Option<SimpleVob> {
-        if !token_prefix.is_empty() {
-            return None;
-        }
-        let key_dbg = if self.mask_cache_debug_enabled && !self.mask_cache_cfg_only_key {
-            Some(self.parser.mask_cache_key_debug(token_prefix))
-        } else {
-            None
-        };
-        let key = if let Some(key_dbg) = &key_dbg {
-            key_dbg.key
-        } else {
-            self.mask_cache_key_for_prefix(token_prefix)
-        };
-
+    fn get_cached_mask(&mut self, token_prefix: &[u8], key: u64) -> Option<SimpleVob> {
         if self.mask_cache.is_empty() {
-            if let Some(key_dbg) = &key_dbg {
-                self.maybe_log_mask_cache_lookup(key_dbg, false, 0);
-            } else {
-                self.maybe_log_mask_cache_lookup_simple(key, false, 0);
-            }
+            self.maybe_log_mask_cache_lookup(key, false, 0);
             return None;
         }
 
@@ -662,20 +570,12 @@ impl TokenParser {
         } else {
             None
         };
-        if let Some(key_dbg) = &key_dbg {
-            self.maybe_log_mask_cache_lookup(key_dbg, res.is_some(), self.mask_cache.len());
-        } else {
-            self.maybe_log_mask_cache_lookup_simple(key, res.is_some(), self.mask_cache.len());
-        }
+        self.maybe_log_mask_cache_lookup(key, res.is_some(), self.mask_cache.len());
         res
     }
 
     #[cfg(feature = "mask_cache")]
-    fn maybe_cache_mask(&mut self, token_prefix: &[u8], mask: &SimpleVob) {
-        if !token_prefix.is_empty() {
-            return;
-        }
-
+    fn maybe_cache_mask(&mut self, key: u64, mask: &SimpleVob) {
         let n_vocab = self.tok_trie().vocab_size();
         if n_vocab == 0 {
             return;
@@ -689,7 +589,6 @@ impl TokenParser {
             return;
         }
 
-        let key = self.mask_cache_key_for_prefix(token_prefix);
         self.mask_cache.insert(key, mask.clone());
     }
 
@@ -858,16 +757,25 @@ impl TokenParser {
         };
 
         #[cfg(feature = "mask_cache")]
-        if let Some(cached) = self.get_cached_mask(&prefix) {
-            infoln!(self, "mask_cache hit");
-            if let Some(s) = self.parser.get_error() {
-                return Err(self.stop_for_parser_error("", s));
+        let cache_key = if prefix.is_empty() {
+            Some(self.mask_cache_key_for_prefix(&prefix))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "mask_cache")]
+        if let Some(key) = cache_key {
+            if let Some(cached) = self.get_cached_mask(&prefix, key) {
+                infoln!(self, "mask_cache hit");
+                if let Some(s) = self.parser.get_error() {
+                    return Err(self.stop_for_parser_error("", s));
+                }
+                self.last_step_stats = ParserStats::default();
+                self.last_bias_time = Duration::from_secs(0);
+                let _ = self.is_accepting();
+                self.log_final(&prefix, &cached);
+                return Ok(cached);
             }
-            self.last_step_stats = ParserStats::default();
-            self.last_bias_time = Duration::from_secs(0);
-            let _ = self.is_accepting();
-            self.log_final(&prefix, &cached);
-            return Ok(cached);
         }
 
         let mut allowed_tokens = self.compute_bias(&prefix);
@@ -881,7 +789,9 @@ impl TokenParser {
         }
 
         #[cfg(feature = "mask_cache")]
-        self.maybe_cache_mask(&prefix, &allowed_tokens);
+        if let Some(key) = cache_key {
+            self.maybe_cache_mask(key, &allowed_tokens);
+        }
 
         self.log_final(&prefix, &allowed_tokens);
 

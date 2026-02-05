@@ -101,31 +101,6 @@ pub struct ParserStats {
     pub num_lexemes: usize,
 }
 
-#[cfg(feature = "mask_cache")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaskCacheKeyDebug {
-    pub key: u64,
-    pub token_idx: usize,
-    pub prefix_len: usize,
-    pub prefix_hash: u64,
-    pub lexer_stack_top_eos: bool,
-    pub top_lexer_state: usize,
-    pub top_byte: Option<u8>,
-    pub row_lexer_start_state: usize,
-    pub row_lexeme_tag: u8,
-    pub row_lexeme_value: usize,
-    pub row_num_items: usize,
-    pub row_items_hash: u64,
-    pub row_min_rel_start: usize,
-    pub row_max_rel_start: usize,
-    pub row_item_args_hash: u64,
-    pub grammar_depth: usize,
-    pub grammar_hash: u64,
-    pub grammar_finite_horizons: usize,
-    pub lexer_suffix_len: usize,
-    pub lexer_suffix_hash: u64,
-}
-
 #[derive(Debug, Clone)]
 pub struct XorShift {
     seed: u32,
@@ -889,85 +864,84 @@ impl ParserState {
     }
 
     #[cfg(feature = "mask_cache")]
-    fn mask_cache_key(&self, start: &[u8]) -> u64 {
-        let t0 = Instant::now();
-        let mut hasher = DefaultHasher::new();
-
-        start.hash(&mut hasher);
-        self.lexer_stack_top_eos.hash(&mut hasher);
-
-        let top = self.lexer_state();
-        top.lexer_state.as_usize().hash(&mut hasher);
-        top.byte.hash(&mut hasher);
-
-        let row_idx = self.num_rows() - 1;
-        let row = &self.rows[row_idx];
-        row.lexer_start_state.as_usize().hash(&mut hasher);
-        match row.lexeme_idx {
-            MatchingLexemesIdx::Single(idx) => {
-                0u8.hash(&mut hasher);
-                idx.as_usize().hash(&mut hasher);
-            }
-            MatchingLexemesIdx::GreedyAccepting(state) => {
-                1u8.hash(&mut hasher);
-                state.as_usize().hash(&mut hasher);
-            }
-            MatchingLexemesIdx::LazyAccepting(state) => {
-                2u8.hash(&mut hasher);
-                state.as_usize().hash(&mut hasher);
-            }
-        }
-
+    fn hash_mask_cache_row_items(&self, hasher: &mut DefaultHasher, row_idx: usize, row: &Row) {
         let first_item = row.first_item as usize;
         let last_item = row.last_item as usize;
-        (last_item - first_item).hash(&mut hasher);
+        (last_item - first_item).hash(hasher);
         let mut min_start = usize::MAX;
         let mut max_start = 0usize;
         for idx in first_item..last_item {
             let item = self.scratch.items[idx];
-            item.rhs_ptr().as_index().hash(&mut hasher);
+            item.rhs_ptr().as_index().hash(hasher);
             let rel_start = row_idx.saturating_sub(item.start_pos());
-            rel_start.hash(&mut hasher);
+            rel_start.hash(hasher);
             min_start = std::cmp::min(min_start, rel_start);
             max_start = std::cmp::max(max_start, rel_start);
         }
         if first_item == last_item {
             min_start = 0;
         }
-        min_start.hash(&mut hasher);
-        max_start.hash(&mut hasher);
+        min_start.hash(hasher);
+        max_start.hash(hasher);
         if self.scratch.parametric {
             for idx in first_item..last_item {
-                self.scratch.item_args[idx].hash(&mut hasher);
+                self.scratch.item_args[idx].hash(hasher);
             }
         }
+    }
 
+    #[cfg(feature = "mask_cache")]
+    fn hash_mask_cache_grammar_stack(&self, hasher: &mut DefaultHasher, row_idx: usize, row: &Row) {
         // Hash the grammar stack semantically to avoid depending on absolute indices.
         let mut stack_ptr = row.grammar_stack_ptr;
         let mut depth = 0usize;
         while stack_ptr.as_usize() > 0 {
             let node = &self.scratch.grammar_stack[stack_ptr.as_usize()];
             depth += 1;
-            node.grammar_id.as_usize().hash(&mut hasher);
-            node.start_item.rhs_ptr().as_index().hash(&mut hasher);
+            node.grammar_id.as_usize().hash(hasher);
+            node.start_item.rhs_ptr().as_index().hash(hasher);
             let rel_start = row_idx.saturating_sub(node.start_item.start_pos());
-            rel_start.hash(&mut hasher);
+            rel_start.hash(hasher);
             // Most frames have no max_tokens boundary (u32::MAX horizon). If we always hash
             // remaining horizon in that case, the key drifts every token and defeats reuse.
             if node.token_horizon == u32::MAX {
-                0u8.hash(&mut hasher);
+                0u8.hash(hasher);
             } else {
-                1u8.hash(&mut hasher);
+                1u8.hash(hasher);
                 node.token_horizon
                     .saturating_sub(self.token_idx as u32)
-                    .hash(&mut hasher);
+                    .hash(hasher);
             }
             if self.scratch.parametric {
-                self.scratch.item_args[node.start_item_idx].hash(&mut hasher);
+                self.scratch.item_args[node.start_item_idx].hash(hasher);
             }
             stack_ptr = node.back_ptr;
         }
-        depth.hash(&mut hasher);
+        depth.hash(hasher);
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn hash_mask_cache_row_lexer_suffix(
+        &self,
+        hasher: &mut DefaultHasher,
+        row_idx: usize,
+        row: &Row,
+    ) {
+        row.lexer_start_state.as_usize().hash(hasher);
+        match row.lexeme_idx {
+            MatchingLexemesIdx::Single(idx) => {
+                0u8.hash(hasher);
+                idx.as_usize().hash(hasher);
+            }
+            MatchingLexemesIdx::GreedyAccepting(state) => {
+                1u8.hash(hasher);
+                state.as_usize().hash(hasher);
+            }
+            MatchingLexemesIdx::LazyAccepting(state) => {
+                2u8.hash(hasher);
+                state.as_usize().hash(hasher);
+            }
+        }
 
         // Include the active suffix of lexer states in the current row,
         // since these bytes are part of recognizer state for trie traversal.
@@ -978,239 +952,46 @@ impl ParserState {
             .rposition(|state| state.row_idx != row_idx_u32)
             .map(|idx| idx + 1)
             .unwrap_or(0);
-        (self.lexer_stack.len() - suffix_start).hash(&mut hasher);
+        (self.lexer_stack.len() - suffix_start).hash(hasher);
         for state in &self.lexer_stack[suffix_start..] {
-            state.lexer_state.as_usize().hash(&mut hasher);
-            state.byte.hash(&mut hasher);
+            state.lexer_state.as_usize().hash(hasher);
+            state.byte.hash(hasher);
         }
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn mask_cache_key_inner(&self, start: &[u8], include_lexer: bool) -> u64 {
+        let t0 = Instant::now();
+        let mut hasher = DefaultHasher::new();
+
+        start.hash(&mut hasher);
+        let row_idx = self.num_rows() - 1;
+        let row = &self.rows[row_idx];
+
+        if include_lexer {
+            self.lexer_stack_top_eos.hash(&mut hasher);
+            let top = self.lexer_state();
+            top.lexer_state.as_usize().hash(&mut hasher);
+            top.byte.hash(&mut hasher);
+            self.hash_mask_cache_row_lexer_suffix(&mut hasher, row_idx, row);
+        }
+
+        self.hash_mask_cache_row_items(&mut hasher, row_idx, row);
+        self.hash_mask_cache_grammar_stack(&mut hasher, row_idx, row);
 
         let key = hasher.finish();
         self.perf_counters.mask_cache_key.record(t0.elapsed());
         key
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn mask_cache_key(&self, start: &[u8]) -> u64 {
+        self.mask_cache_key_inner(start, true)
     }
 
     #[cfg(feature = "mask_cache")]
     fn mask_cache_key_cfg_only(&self, start: &[u8]) -> u64 {
-        let t0 = Instant::now();
-        let mut hasher = DefaultHasher::new();
-
-        // Keep token-prefix in key: it is part of the recognizer input.
-        start.hash(&mut hasher);
-
-        let row_idx = self.num_rows() - 1;
-        let row = &self.rows[row_idx];
-
-        let first_item = row.first_item as usize;
-        let last_item = row.last_item as usize;
-        (last_item - first_item).hash(&mut hasher);
-        let mut min_start = usize::MAX;
-        let mut max_start = 0usize;
-        for idx in first_item..last_item {
-            let item = self.scratch.items[idx];
-            item.rhs_ptr().as_index().hash(&mut hasher);
-            let rel_start = row_idx.saturating_sub(item.start_pos());
-            rel_start.hash(&mut hasher);
-            min_start = std::cmp::min(min_start, rel_start);
-            max_start = std::cmp::max(max_start, rel_start);
-        }
-        if first_item == last_item {
-            min_start = 0;
-        }
-        min_start.hash(&mut hasher);
-        max_start.hash(&mut hasher);
-        if self.scratch.parametric {
-            for idx in first_item..last_item {
-                self.scratch.item_args[idx].hash(&mut hasher);
-            }
-        }
-
-        // Hash grammar stack semantics (including finite max_tokens horizons).
-        let mut stack_ptr = row.grammar_stack_ptr;
-        let mut depth = 0usize;
-        while stack_ptr.as_usize() > 0 {
-            let node = &self.scratch.grammar_stack[stack_ptr.as_usize()];
-            depth += 1;
-            node.grammar_id.as_usize().hash(&mut hasher);
-            node.start_item.rhs_ptr().as_index().hash(&mut hasher);
-            let rel_start = row_idx.saturating_sub(node.start_item.start_pos());
-            rel_start.hash(&mut hasher);
-            if node.token_horizon == u32::MAX {
-                0u8.hash(&mut hasher);
-            } else {
-                1u8.hash(&mut hasher);
-                node.token_horizon
-                    .saturating_sub(self.token_idx as u32)
-                    .hash(&mut hasher);
-            }
-            if self.scratch.parametric {
-                self.scratch.item_args[node.start_item_idx].hash(&mut hasher);
-            }
-            stack_ptr = node.back_ptr;
-        }
-        depth.hash(&mut hasher);
-
-        let key = hasher.finish();
-        self.perf_counters.mask_cache_key.record(t0.elapsed());
-        key
-    }
-
-    #[cfg(feature = "mask_cache")]
-    fn mask_cache_key_debug(&self, start: &[u8]) -> MaskCacheKeyDebug {
-        let t0 = Instant::now();
-        let mut hasher = DefaultHasher::new();
-        let mut prefix_hasher = DefaultHasher::new();
-
-        start.hash(&mut hasher);
-        start.hash(&mut prefix_hasher);
-        self.lexer_stack_top_eos.hash(&mut hasher);
-
-        let top = self.lexer_state();
-        let top_lexer_state = top.lexer_state.as_usize();
-        top_lexer_state.hash(&mut hasher);
-        top.byte.hash(&mut hasher);
-
-        let row_idx = self.num_rows() - 1;
-        let row = &self.rows[row_idx];
-        let row_lexer_start_state = row.lexer_start_state.as_usize();
-        row_lexer_start_state.hash(&mut hasher);
-        let (row_lexeme_tag, row_lexeme_value) = match row.lexeme_idx {
-            MatchingLexemesIdx::Single(idx) => {
-                0u8.hash(&mut hasher);
-                idx.as_usize().hash(&mut hasher);
-                (0u8, idx.as_usize())
-            }
-            MatchingLexemesIdx::GreedyAccepting(state) => {
-                1u8.hash(&mut hasher);
-                state.as_usize().hash(&mut hasher);
-                (1u8, state.as_usize())
-            }
-            MatchingLexemesIdx::LazyAccepting(state) => {
-                2u8.hash(&mut hasher);
-                state.as_usize().hash(&mut hasher);
-                (2u8, state.as_usize())
-            }
-        };
-
-        let first_item = row.first_item as usize;
-        let last_item = row.last_item as usize;
-        let row_num_items = last_item - first_item;
-        let mut row_items_hasher = DefaultHasher::new();
-        let mut row_item_args_hasher = DefaultHasher::new();
-        (last_item - first_item).hash(&mut hasher);
-        let mut min_start = usize::MAX;
-        let mut max_start = 0usize;
-        for idx in first_item..last_item {
-            let item = self.scratch.items[idx];
-            item.rhs_ptr().as_index().hash(&mut hasher);
-            item.rhs_ptr().as_index().hash(&mut row_items_hasher);
-            let rel_start = row_idx.saturating_sub(item.start_pos());
-            rel_start.hash(&mut hasher);
-            rel_start.hash(&mut row_items_hasher);
-            min_start = std::cmp::min(min_start, rel_start);
-            max_start = std::cmp::max(max_start, rel_start);
-        }
-        if first_item == last_item {
-            min_start = 0;
-        }
-        min_start.hash(&mut hasher);
-        max_start.hash(&mut hasher);
-        if self.scratch.parametric {
-            for idx in first_item..last_item {
-                self.scratch.item_args[idx].hash(&mut hasher);
-                self.scratch.item_args[idx].hash(&mut row_item_args_hasher);
-            }
-        }
-
-        // Hash the grammar stack semantically to avoid depending on absolute indices.
-        let mut stack_ptr = row.grammar_stack_ptr;
-        let mut depth = 0usize;
-        let mut grammar_hasher = DefaultHasher::new();
-        let mut grammar_finite_horizons = 0usize;
-        while stack_ptr.as_usize() > 0 {
-            let node = &self.scratch.grammar_stack[stack_ptr.as_usize()];
-            depth += 1;
-            node.grammar_id.as_usize().hash(&mut hasher);
-            node.grammar_id.as_usize().hash(&mut grammar_hasher);
-            node.start_item.rhs_ptr().as_index().hash(&mut hasher);
-            node.start_item
-                .rhs_ptr()
-                .as_index()
-                .hash(&mut grammar_hasher);
-            let rel_start = row_idx.saturating_sub(node.start_item.start_pos());
-            rel_start.hash(&mut hasher);
-            rel_start.hash(&mut grammar_hasher);
-            // Most frames have no max_tokens boundary (u32::MAX horizon). If we always hash
-            // remaining horizon in that case, the key drifts every token and defeats reuse.
-            if node.token_horizon == u32::MAX {
-                0u8.hash(&mut hasher);
-                0u8.hash(&mut grammar_hasher);
-            } else {
-                1u8.hash(&mut hasher);
-                1u8.hash(&mut grammar_hasher);
-                grammar_finite_horizons += 1;
-                let remaining_horizon = node.token_horizon.saturating_sub(self.token_idx as u32);
-                node.token_horizon
-                    .saturating_sub(self.token_idx as u32)
-                    .hash(&mut hasher);
-                remaining_horizon.hash(&mut grammar_hasher);
-            }
-            if self.scratch.parametric {
-                self.scratch.item_args[node.start_item_idx].hash(&mut hasher);
-                self.scratch.item_args[node.start_item_idx].hash(&mut grammar_hasher);
-            }
-            stack_ptr = node.back_ptr;
-        }
-        depth.hash(&mut hasher);
-        depth.hash(&mut grammar_hasher);
-
-        // Include the active suffix of lexer states in the current row,
-        // since these bytes are part of recognizer state for trie traversal.
-        let row_idx_u32 = row_idx as u32;
-        let suffix_start = self
-            .lexer_stack
-            .iter()
-            .rposition(|state| state.row_idx != row_idx_u32)
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let lexer_suffix_len = self.lexer_stack.len() - suffix_start;
-        let mut lexer_suffix_hasher = DefaultHasher::new();
-        lexer_suffix_len.hash(&mut hasher);
-        lexer_suffix_len.hash(&mut lexer_suffix_hasher);
-        for state in &self.lexer_stack[suffix_start..] {
-            state.lexer_state.as_usize().hash(&mut hasher);
-            state.lexer_state.as_usize().hash(&mut lexer_suffix_hasher);
-            state.byte.hash(&mut hasher);
-            state.byte.hash(&mut lexer_suffix_hasher);
-        }
-
-        let key = hasher.finish();
-        self.perf_counters.mask_cache_key.record(t0.elapsed());
-        MaskCacheKeyDebug {
-            key,
-            token_idx: self.token_idx,
-            prefix_len: start.len(),
-            prefix_hash: prefix_hasher.finish(),
-            lexer_stack_top_eos: self.lexer_stack_top_eos,
-            top_lexer_state,
-            top_byte: top.byte,
-            row_lexer_start_state,
-            row_lexeme_tag,
-            row_lexeme_value,
-            row_num_items,
-            row_items_hash: row_items_hasher.finish(),
-            row_min_rel_start: min_start,
-            row_max_rel_start: max_start,
-            row_item_args_hash: if self.scratch.parametric {
-                row_item_args_hasher.finish()
-            } else {
-                0
-            },
-            grammar_depth: depth,
-            grammar_hash: grammar_hasher.finish(),
-            grammar_finite_horizons,
-            lexer_suffix_len,
-            lexer_suffix_hash: lexer_suffix_hasher.finish(),
-        }
+        self.mask_cache_key_inner(start, false)
     }
 
     fn after_dots(&self) -> impl Iterator<Item = RhsPtr> + '_ {
@@ -3129,11 +2910,6 @@ impl Parser {
     #[cfg(feature = "mask_cache")]
     pub fn mask_cache_key_cfg_only(&mut self, start: &[u8]) -> u64 {
         self.with_shared(|state| state.mask_cache_key_cfg_only(start))
-    }
-
-    #[cfg(feature = "mask_cache")]
-    pub fn mask_cache_key_debug(&mut self, start: &[u8]) -> MaskCacheKeyDebug {
-        self.with_shared(|state| state.mask_cache_key_debug(start))
     }
 
     pub fn captures(&self) -> &[(String, Vec<u8>)] {
