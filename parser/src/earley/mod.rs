@@ -14,6 +14,8 @@ pub use grammar::{
     BitIdx, CGrammar, CSymIdx, Grammar, ParamCond, ParamExpr, ParamRef, ParamValue, SymIdx,
     SymbolProps,
 };
+#[cfg(feature = "mask_cache")]
+pub use parser::MaskCacheKeyDebug;
 pub use parser::{
     BiasComputer, Parser, ParserError, ParserMetrics, ParserRecognizer, ParserStats, XorShift,
 };

@@ -1,14 +1,22 @@
 use std::hint::black_box;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use llguidance::{
     api::TopLevelGrammar,
-    toktrie::{TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv},
+    toktrie::{SimpleVob, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv},
     Matcher, ParserFactory,
 };
 
 const BLOG_SCHEMA_JSON: &str = include_str!("../../sample_parser/data/blog.schema.json");
+const DEFAULT_BENCH_TOKENIZER: &str = "benches/data/llama3_tokenizer.json";
+const DEFAULT_BENCH_TOKENIZER_ALT: &str = "parser/benches/data/llama3_tokenizer.json"; // TODO fix this
+const BENCH_TOKENIZER_ENV: &str = "LLGUIDANCE_BENCH_TOKENIZER";
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_LABEL: &str = "cache_on";
+#[cfg(not(feature = "mask_cache"))]
+const MASK_CACHE_LABEL: &str = "cache_off";
 
 // Different prefixes representing various parser states
 const PREFIX_START: &[u8] = b""; // Start of JSON
@@ -60,17 +68,82 @@ fn blog_grammar() -> TopLevelGrammar {
     TopLevelGrammar::from_json_schema(schema)
 }
 
+fn regex_grammar(regex: &str) -> TopLevelGrammar {
+    TopLevelGrammar::from_regex(regex)
+}
+
+fn consume_prefix_bytes(matcher: &mut Matcher, tok_env: &TokEnv, prefix: &[u8]) {
+    let tokens = tok_env.tokenize_bytes(prefix);
+    for tok in tokens {
+        let mask = matcher.compute_mask().unwrap();
+        assert!(mask.is_allowed(tok), "prefix token {tok} is not allowed");
+        matcher.consume_token(tok).unwrap();
+    }
+}
+
 fn matcher_at_prefix(tok_env: &TokEnv, prefix: &[u8]) -> Matcher {
     let mut factory = ParserFactory::new_simple(tok_env).unwrap();
     factory.quiet();
     let mut matcher = Matcher::new(factory.create_parser(blog_grammar()));
-
-    for &byte in prefix {
-        let mask = matcher.compute_mask().unwrap();
-        assert!(mask.is_allowed(byte as TokenId));
-        matcher.consume_token(byte as TokenId).unwrap();
-    }
+    consume_prefix_bytes(&mut matcher, tok_env, prefix);
     matcher
+}
+
+fn regex_matcher_at_prefix(tok_env: &TokEnv, regex: &str, prefix: &[u8]) -> Matcher {
+    let mut factory = ParserFactory::new_simple(tok_env).unwrap();
+    factory.quiet();
+    let mut matcher = Matcher::new(factory.create_parser(regex_grammar(regex)));
+    consume_prefix_bytes(&mut matcher, tok_env, prefix);
+    matcher
+}
+
+fn bench_tokenizer_path() -> PathBuf {
+    if let Ok(path) = std::env::var(BENCH_TOKENIZER_ENV) {
+        return PathBuf::from(path);
+    }
+
+    let default = PathBuf::from(DEFAULT_BENCH_TOKENIZER);
+    if default.exists() {
+        return default;
+    }
+
+    PathBuf::from(DEFAULT_BENCH_TOKENIZER_ALT)
+}
+
+fn real_tok_env() -> Option<TokEnv> {
+    static TOK_ENV: OnceLock<Option<TokEnv>> = OnceLock::new();
+    TOK_ENV
+        .get_or_init(|| {
+            let path = bench_tokenizer_path();
+            if !path.exists() {
+                return None;
+            }
+            let btok = toktrie_hf_tokenizers::ByteTokenizer::from_file(path).ok()?;
+            btok.into_tok_env(None).ok()
+        })
+        .clone()
+}
+
+fn pick_loop_token(tok_env: &TokEnv, mask: &SimpleVob, forbidden_byte: Option<u8>) -> TokenId {
+    let trie = tok_env.tok_trie();
+    let eos = trie.eos_token();
+    let forbid = forbidden_byte;
+
+    for tok in 0..trie.vocab_size() as TokenId {
+        if tok == eos || !mask.is_allowed(tok) {
+            continue;
+        }
+        let bytes = trie.token(tok);
+        if bytes.is_empty() || bytes[0] == TokTrie::SPECIAL_TOKEN_MARKER {
+            continue;
+        }
+        if forbid.is_some_and(|b| bytes.contains(&b)) {
+            continue;
+        }
+        return tok;
+    }
+
+    panic!("no reusable token found in mask")
 }
 
 /// Benchmark compute_mask at different vocabulary sizes.
@@ -182,6 +255,67 @@ fn bench_first_mask(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark generation in permissive regex states where masks are dense.
+/// Build with --features mask_cache to compare cache-on vs cache-off.
+fn bench_permissive_regex_generation(c: &mut Criterion) {
+    use criterion::BatchSize;
+
+    let mut group = c.benchmark_group("permissive_regex_generation");
+    let num_tokens = 64usize;
+    let regexes: [(&str, &str, &[u8], Option<u8>); 2] = [
+        ("dot_star", ".*", b"", None),
+        ("not_x_then_x", "[^x]*x", b"aaaaaaaaaaaaaaaa", Some(b'x')),
+    ];
+
+    let tok_envs: Vec<(String, TokEnv)> = if let Some(real) = real_tok_env() {
+        vec![("llama3".to_string(), real)]
+    } else {
+        eprintln!(
+            "warning: {} missing; using synthetic vocab for permissive benchmark",
+            bench_tokenizer_path().display()
+        );
+        vec![
+            ("synthetic_32768".to_string(), synthetic_tok_env(32_768)),
+            ("synthetic_65536".to_string(), synthetic_tok_env(65_536)),
+        ]
+    };
+
+    group.throughput(Throughput::Elements(num_tokens as u64));
+    for (tok_env_name, tok_env) in tok_envs {
+        let vocab_size = tok_env.tok_trie().vocab_size();
+        for (name, regex, prefix, forbidden_byte) in regexes {
+            let bench_name = format!("{name}_{MASK_CACHE_LABEL}_{tok_env_name}");
+            group.bench_with_input(
+                BenchmarkId::new(bench_name, vocab_size),
+                &vocab_size,
+                |b, &_size| {
+                    let tok_env = tok_env.clone();
+
+                    b.iter_batched(
+                        || {
+                            let mut m = regex_matcher_at_prefix(&tok_env, regex, prefix);
+                            let first_mask = m.compute_mask().unwrap();
+                            let target_token =
+                                pick_loop_token(&tok_env, &first_mask, forbidden_byte);
+                            (m, target_token)
+                        },
+                        |(mut m, target_token)| {
+                            for _ in 0..num_tokens {
+                                let mask = m.compute_mask().unwrap();
+                                assert!(mask.is_allowed(target_token));
+                                m.consume_token(target_token).unwrap();
+                            }
+                            black_box(m)
+                        },
+                        BatchSize::SmallInput,
+                    )
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -189,6 +323,6 @@ criterion_group! {
         .warm_up_time(std::time::Duration::from_secs(2))
         .measurement_time(std::time::Duration::from_secs(5))
         .noise_threshold(0.05);
-    targets = bench_compute_mask, bench_compute_mask_positions, bench_token_generation, bench_first_mask
+    targets = bench_compute_mask, bench_compute_mask_positions, bench_token_generation, bench_first_mask, bench_permissive_regex_generation
 }
 criterion_main!(benches);

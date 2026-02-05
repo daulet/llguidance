@@ -1,5 +1,7 @@
 use std::{fmt::Display, hint::black_box, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
+#[cfg(feature = "mask_cache")]
+use crate::earley::MaskCacheKeyDebug;
 use crate::{
     api::{GrammarInit, ParserLimits, StopReason},
     earley::{BiasComputer, Parser, ParserError, ParserStats},
@@ -7,6 +9,69 @@ use crate::{
 };
 use anyhow::{ensure, Result};
 use toktrie::{InferenceCapabilities, SimpleVob, TokEnv, TokenId, INVALID_TOKEN};
+
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_CAPACITY: usize = 32;
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_MIN_DENSITY_PERCENT: usize = 85;
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_MIN_TRIE_NODES_WALKED: usize = 0;
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_DEBUG_ENV: &str = "LLGUIDANCE_MASK_CACHE_DEBUG";
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_DEBUG_LIMIT_ENV: &str = "LLGUIDANCE_MASK_CACHE_DEBUG_LIMIT";
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_DEBUG_DEFAULT_LIMIT: usize = 128;
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_CFG_ONLY_KEY_ENV: &str = "LLGUIDANCE_MASK_CACHE_CFG_ONLY_KEY";
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_CFG_ONLY_VERIFY_ENV: &str = "LLGUIDANCE_MASK_CACHE_CFG_ONLY_VERIFY";
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_CFG_ONLY_VERIFY_RATE_ENV: &str = "LLGUIDANCE_MASK_CACHE_CFG_ONLY_VERIFY_RATE";
+#[cfg(feature = "mask_cache")]
+const MASK_CACHE_CFG_ONLY_VERIFY_DEFAULT_RATE: u32 = 64;
+
+#[cfg(feature = "mask_cache")]
+#[derive(Clone)]
+struct MaskCacheEntry {
+    key: u64,
+    mask: SimpleVob,
+}
+
+#[cfg(feature = "mask_cache")]
+#[derive(Clone, Default)]
+struct MaskCache {
+    entries: Vec<MaskCacheEntry>,
+}
+
+#[cfg(feature = "mask_cache")]
+impl MaskCache {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&mut self, key: u64) -> Option<SimpleVob> {
+        let pos = self.entries.iter().position(|entry| entry.key == key)?;
+        let entry = self.entries.remove(pos);
+        let mask = entry.mask.clone();
+        self.entries.push(entry);
+        Some(mask)
+    }
+
+    fn insert(&mut self, key: u64, mask: SimpleVob) {
+        if let Some(pos) = self.entries.iter().position(|entry| entry.key == key) {
+            self.entries.remove(pos);
+        }
+        self.entries.push(MaskCacheEntry { key, mask });
+        if self.entries.len() > MASK_CACHE_CAPACITY {
+            self.entries.remove(0);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct TokenParser {
@@ -31,6 +96,22 @@ pub struct TokenParser {
     stop_reason: StopReason,
     error_message: Option<String>,
     max_tokens_total: usize,
+    #[cfg(feature = "mask_cache")]
+    mask_cache: MaskCache,
+    #[cfg(feature = "mask_cache")]
+    mask_cache_debug_enabled: bool,
+    #[cfg(feature = "mask_cache")]
+    mask_cache_debug_remaining: usize,
+    #[cfg(feature = "mask_cache")]
+    mask_cache_cfg_only_key: bool,
+    #[cfg(feature = "mask_cache")]
+    mask_cache_cfg_only_verify: bool,
+    #[cfg(feature = "mask_cache")]
+    mask_cache_cfg_only_verify_rate: u32,
+    #[cfg(feature = "mask_cache")]
+    mask_cache_cfg_only_verify_state: u64,
+    #[cfg(feature = "mask_cache")]
+    prev_mask_cache_key_debug: Option<MaskCacheKeyDebug>,
 
     // tokens currently in KV cache
     llm_tokens: Vec<TokenId>,
@@ -92,6 +173,21 @@ impl TokenParser {
         )?;
         parser.metrics_mut().rand = factory.next_rng();
         let eos_token = token_env.tok_trie().eos_token();
+        #[cfg(feature = "mask_cache")]
+        let mask_cache_debug_enabled = Self::mask_cache_debug_enabled_from_env();
+        #[cfg(feature = "mask_cache")]
+        let mask_cache_debug_remaining =
+            Self::mask_cache_debug_limit_from_env(MASK_CACHE_DEBUG_DEFAULT_LIMIT);
+        #[cfg(feature = "mask_cache")]
+        let mask_cache_cfg_only_key = Self::env_var_enabled(MASK_CACHE_CFG_ONLY_KEY_ENV);
+        #[cfg(feature = "mask_cache")]
+        let mask_cache_cfg_only_verify = Self::env_var_enabled(MASK_CACHE_CFG_ONLY_VERIFY_ENV);
+        #[cfg(feature = "mask_cache")]
+        let mask_cache_cfg_only_verify_rate = Self::env_var_u32(
+            MASK_CACHE_CFG_ONLY_VERIFY_RATE_ENV,
+            MASK_CACHE_CFG_ONLY_VERIFY_DEFAULT_RATE,
+        )
+        .max(1);
 
         Ok(TokenParser {
             bias_computer: factory.slicer().clone(),
@@ -106,6 +202,22 @@ impl TokenParser {
             ff_tokens_cache: None,
             stop_reason: StopReason::NotStopped,
             error_message: None,
+            #[cfg(feature = "mask_cache")]
+            mask_cache: MaskCache::default(),
+            #[cfg(feature = "mask_cache")]
+            mask_cache_debug_enabled,
+            #[cfg(feature = "mask_cache")]
+            mask_cache_debug_remaining,
+            #[cfg(feature = "mask_cache")]
+            mask_cache_cfg_only_key,
+            #[cfg(feature = "mask_cache")]
+            mask_cache_cfg_only_verify,
+            #[cfg(feature = "mask_cache")]
+            mask_cache_cfg_only_verify_rate,
+            #[cfg(feature = "mask_cache")]
+            mask_cache_cfg_only_verify_state: 0x9E37_79B9_7F4A_7C15,
+            #[cfg(feature = "mask_cache")]
+            prev_mask_cache_key_debug: None,
             parser,
             dbg_grammar: String::new(),
             eos_token,
@@ -322,6 +434,265 @@ impl TokenParser {
         self.ff_tokens_cache = None;
     }
 
+    #[cfg(feature = "mask_cache")]
+    fn env_var_enabled(name: &str) -> bool {
+        match std::env::var(name) {
+            Ok(val) => {
+                let v = val.trim().to_ascii_lowercase();
+                !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn mask_cache_debug_enabled_from_env() -> bool {
+        Self::env_var_enabled(MASK_CACHE_DEBUG_ENV)
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn env_var_u32(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(default)
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn mask_cache_key_for_prefix(&mut self, token_prefix: &[u8]) -> u64 {
+        if self.mask_cache_cfg_only_key {
+            self.parser.mask_cache_key_cfg_only(token_prefix)
+        } else {
+            self.parser.mask_cache_key(token_prefix)
+        }
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn mask_sets_equal(lhs: &SimpleVob, rhs: &SimpleVob) -> bool {
+        lhs.len() == rhs.len() && lhs.num_set() == rhs.num_set() && lhs.to_list() == rhs.to_list()
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn should_verify_cfg_only_hit(&mut self) -> bool {
+        if !self.mask_cache_cfg_only_key || !self.mask_cache_cfg_only_verify {
+            return false;
+        }
+        if self.mask_cache_cfg_only_verify_rate <= 1 {
+            return true;
+        }
+
+        let mut x = self.mask_cache_cfg_only_verify_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.mask_cache_cfg_only_verify_state = x;
+        x % (self.mask_cache_cfg_only_verify_rate as u64) == 0
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn verify_cfg_only_cached_mask(&mut self, token_prefix: &[u8], cached: &SimpleVob) -> bool {
+        if !self.should_verify_cfg_only_hit() {
+            return true;
+        }
+
+        let prev_parser_stats = self.parser.stats().clone();
+        let prev_last_step_stats = self.last_step_stats.clone();
+        let prev_max_step_stats = self.max_step_stats.clone();
+        let prev_last_bias_time = self.last_bias_time;
+        let prev_is_accepting_cache = self.is_accepting_cache;
+
+        let mut recomputed = self.compute_bias(token_prefix);
+        let had_error = self.parser.get_error().is_some();
+        if self.eos_token != INVALID_TOKEN && self.is_accepting() {
+            recomputed.allow_token(self.eos_token);
+        }
+
+        // Verification is for safety checks, so restore externally visible counters/stats.
+        self.last_step_stats = prev_last_step_stats;
+        self.max_step_stats = prev_max_step_stats;
+        self.last_bias_time = prev_last_bias_time;
+        self.is_accepting_cache = prev_is_accepting_cache;
+        self.parser.with_recognizer(|r| {
+            *r.stats_mut() = prev_parser_stats;
+        });
+
+        !had_error && Self::mask_sets_equal(cached, &recomputed)
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn disable_cfg_only_key(&mut self, reason: &str) {
+        if self.mask_cache_cfg_only_key {
+            warn!(self, "{reason}; disabling cfg-only mask cache key");
+        }
+        self.mask_cache_cfg_only_key = false;
+        self.mask_cache_cfg_only_verify = false;
+        self.mask_cache = MaskCache::default();
+        self.prev_mask_cache_key_debug = None;
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn maybe_log_mask_cache_lookup_simple(&mut self, key: u64, hit: bool, cache_size: usize) {
+        if !self.mask_cache_debug_enabled || self.mask_cache_debug_remaining == 0 {
+            return;
+        }
+        self.mask_cache_debug_remaining -= 1;
+        eprintln!(
+            "mask_cache_key[lookup] {} mode={} cache_size={} key={}",
+            if hit { "hit" } else { "miss" },
+            if self.mask_cache_cfg_only_key {
+                "cfg_only"
+            } else {
+                "full"
+            },
+            cache_size,
+            key
+        );
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn maybe_log_mask_cache_lookup(
+        &mut self,
+        key_dbg: &MaskCacheKeyDebug,
+        hit: bool,
+        cache_size: usize,
+    ) {
+        if !self.mask_cache_debug_enabled || self.mask_cache_debug_remaining == 0 {
+            return;
+        }
+        self.mask_cache_debug_remaining -= 1;
+
+        let mut changes = Vec::new();
+        if let Some(prev) = &self.prev_mask_cache_key_debug {
+            macro_rules! diff {
+                ($field:ident) => {
+                    if prev.$field != key_dbg.$field {
+                        changes.push(format!(
+                            "{}:{:?}->{:?}",
+                            stringify!($field),
+                            prev.$field,
+                            key_dbg.$field
+                        ));
+                    }
+                };
+            }
+            diff!(key);
+            diff!(prefix_hash);
+            diff!(lexer_stack_top_eos);
+            diff!(top_lexer_state);
+            diff!(top_byte);
+            diff!(row_lexer_start_state);
+            diff!(row_lexeme_tag);
+            diff!(row_lexeme_value);
+            diff!(row_num_items);
+            diff!(row_items_hash);
+            diff!(row_min_rel_start);
+            diff!(row_max_rel_start);
+            diff!(row_item_args_hash);
+            diff!(grammar_depth);
+            diff!(grammar_hash);
+            diff!(grammar_finite_horizons);
+            diff!(lexer_suffix_len);
+            diff!(lexer_suffix_hash);
+        } else {
+            changes.push("first_observation".to_string());
+        }
+
+        let changed = if changes.is_empty() {
+            "none".to_string()
+        } else {
+            changes.join(", ")
+        };
+
+        eprintln!(
+            "mask_cache_key[lookup] {} mode=full cache_size={} key={} token_idx={} prefix_len={} changed={}",
+            if hit { "hit" } else { "miss" },
+            cache_size,
+            key_dbg.key,
+            key_dbg.token_idx,
+            key_dbg.prefix_len,
+            changed
+        );
+
+        self.prev_mask_cache_key_debug = Some(key_dbg.clone());
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn mask_cache_debug_limit_from_env(default: usize) -> usize {
+        std::env::var(MASK_CACHE_DEBUG_LIMIT_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn get_cached_mask(&mut self, token_prefix: &[u8]) -> Option<SimpleVob> {
+        if !token_prefix.is_empty() {
+            return None;
+        }
+        let key_dbg = if self.mask_cache_debug_enabled && !self.mask_cache_cfg_only_key {
+            Some(self.parser.mask_cache_key_debug(token_prefix))
+        } else {
+            None
+        };
+        let key = if let Some(key_dbg) = &key_dbg {
+            key_dbg.key
+        } else {
+            self.mask_cache_key_for_prefix(token_prefix)
+        };
+
+        if self.mask_cache.is_empty() {
+            if let Some(key_dbg) = &key_dbg {
+                self.maybe_log_mask_cache_lookup(key_dbg, false, 0);
+            } else {
+                self.maybe_log_mask_cache_lookup_simple(key, false, 0);
+            }
+            return None;
+        }
+
+        let res = self.mask_cache.get(key);
+        let res = if let Some(cached) = res {
+            if self.mask_cache_cfg_only_key
+                && !self.verify_cfg_only_cached_mask(token_prefix, &cached)
+            {
+                self.disable_cfg_only_key("cfg-only cache-key verification failed");
+                None
+            } else {
+                Some(cached)
+            }
+        } else {
+            None
+        };
+        if let Some(key_dbg) = &key_dbg {
+            self.maybe_log_mask_cache_lookup(key_dbg, res.is_some(), self.mask_cache.len());
+        } else {
+            self.maybe_log_mask_cache_lookup_simple(key, res.is_some(), self.mask_cache.len());
+        }
+        res
+    }
+
+    #[cfg(feature = "mask_cache")]
+    fn maybe_cache_mask(&mut self, token_prefix: &[u8], mask: &SimpleVob) {
+        if !token_prefix.is_empty() {
+            return;
+        }
+
+        let n_vocab = self.tok_trie().vocab_size();
+        if n_vocab == 0 {
+            return;
+        }
+
+        let density_pct = mask.num_set() * 100 / n_vocab;
+        if density_pct < MASK_CACHE_MIN_DENSITY_PERCENT {
+            return;
+        }
+        if self.last_step_stats.trie_nodes_walked < MASK_CACHE_MIN_TRIE_NODES_WALKED {
+            return;
+        }
+
+        let key = self.mask_cache_key_for_prefix(token_prefix);
+        self.mask_cache.insert(key, mask.clone());
+    }
+
     fn stop(&mut self, warn: &str, reason: StopReason) -> anyhow::Error {
         if !warn.is_empty() {
             self.error_message = Some(warn.to_string());
@@ -486,6 +857,19 @@ impl TokenParser {
             trg
         };
 
+        #[cfg(feature = "mask_cache")]
+        if let Some(cached) = self.get_cached_mask(&prefix) {
+            infoln!(self, "mask_cache hit");
+            if let Some(s) = self.parser.get_error() {
+                return Err(self.stop_for_parser_error("", s));
+            }
+            self.last_step_stats = ParserStats::default();
+            self.last_bias_time = Duration::from_secs(0);
+            let _ = self.is_accepting();
+            self.log_final(&prefix, &cached);
+            return Ok(cached);
+        }
+
         let mut allowed_tokens = self.compute_bias(&prefix);
 
         if let Some(s) = self.parser.get_error() {
@@ -495,6 +879,9 @@ impl TokenParser {
         if self.eos_token != INVALID_TOKEN && self.is_accepting() {
             allowed_tokens.allow_token(self.eos_token);
         }
+
+        #[cfg(feature = "mask_cache")]
+        self.maybe_cache_mask(&prefix, &allowed_tokens);
 
         self.log_final(&prefix, &allowed_tokens);
 
@@ -950,5 +1337,157 @@ impl TokenParser {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "mask_cache"))]
+mod tests {
+    use std::sync::Arc;
+
+    use toktrie::{TokRxInfo, TokTrie, TokenizerEnv};
+
+    use crate::{api::TopLevelGrammar, ParserFactory};
+
+    use super::*;
+
+    struct SyntheticTokEnv {
+        trie: TokTrie,
+    }
+
+    impl TokenizerEnv for SyntheticTokEnv {
+        fn tok_trie(&self) -> &TokTrie {
+            &self.trie
+        }
+
+        fn tokenize_bytes(&self, s: &[u8]) -> Vec<TokenId> {
+            self.trie.greedy_tokenize(s)
+        }
+
+        fn tokenize_is_canonical(&self) -> bool {
+            false
+        }
+    }
+
+    fn synthetic_tok_env(vocab_size: usize) -> TokEnv {
+        let eos_token = (vocab_size - 1) as TokenId;
+        let mut tokens = Vec::with_capacity(vocab_size);
+
+        for byte in 0u8..=255 {
+            tokens.push(vec![byte]);
+        }
+
+        let patterns: &[&[u8]] = &[
+            b"aa", b"aaa", b"aaaa", b"ab", b"ba", b"!!", b"json", b"token", b"regex",
+        ];
+        while tokens.len() + 1 < vocab_size {
+            let idx = tokens.len() % patterns.len();
+            tokens.push(patterns[idx].to_vec());
+        }
+
+        tokens.push(b"\xFF<|eos|>".to_vec());
+        let trie = TokTrie::from(&TokRxInfo::new(vocab_size as u32, eos_token), &tokens);
+        Arc::new(SyntheticTokEnv { trie })
+    }
+
+    fn mk_parser(tok_env: &TokEnv, regex: &str) -> TokenParser {
+        let mut factory = ParserFactory::new_simple(tok_env).unwrap();
+        factory.quiet();
+        let mut parser = factory
+            .create_parser(TopLevelGrammar::from_regex(regex))
+            .unwrap();
+        parser.start_without_prompt();
+        parser
+    }
+
+    fn next_rand(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn cfg_only_key_verifier_preserves_correctness_random_steps() {
+        let tok_env = synthetic_tok_env(1024);
+        let mut full = mk_parser(&tok_env, "[^x]*x");
+        let mut cfg_only = mk_parser(&tok_env, "[^x]*x");
+        full.mask_cache_cfg_only_key = false;
+        cfg_only.mask_cache_cfg_only_key = true;
+        cfg_only.mask_cache_cfg_only_verify = true;
+        cfg_only.mask_cache_cfg_only_verify_rate = 1;
+
+        let mut rng_state = 0x1234_5678_9ABC_DEF0u64;
+        let eos = tok_env.tok_trie().eos_token();
+
+        for step in 0..300usize {
+            let full_mask = full.compute_mask().unwrap();
+            let cfg_mask = cfg_only.compute_mask().unwrap();
+            assert!(
+                TokenParser::mask_sets_equal(&full_mask, &cfg_mask),
+                "mask mismatch at step {step}: full={} cfg={}",
+                full_mask.num_set(),
+                cfg_mask.num_set()
+            );
+
+            let mut candidates = Vec::new();
+            for tok in full_mask.to_list() {
+                if tok == eos {
+                    continue;
+                }
+                let bytes = tok_env.tok_trie().token(tok);
+                if bytes.is_empty() || bytes[0] == TokTrie::SPECIAL_TOKEN_MARKER {
+                    continue;
+                }
+                if bytes.contains(&b'x') {
+                    continue;
+                }
+                candidates.push(tok);
+            }
+
+            if candidates.is_empty() {
+                break;
+            }
+
+            let idx = (next_rand(&mut rng_state) as usize) % candidates.len();
+            let tok = candidates[idx];
+
+            let bt_full = full.consume_token(tok).unwrap();
+            let bt_cfg = cfg_only.consume_token(tok).unwrap();
+            assert_eq!(bt_full, bt_cfg, "backtrack mismatch at step {step}");
+
+            let stop_full = full.check_stop().unwrap();
+            let stop_cfg = cfg_only.check_stop().unwrap();
+            assert_eq!(stop_full, stop_cfg, "stop mismatch at step {step}");
+            if stop_full {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn cfg_only_key_auto_disables_on_mismatch() {
+        let tok_env = synthetic_tok_env(512);
+        let mut parser = mk_parser(&tok_env, ".*");
+        parser.mask_cache_cfg_only_key = true;
+        parser.mask_cache_cfg_only_verify = true;
+        parser.mask_cache_cfg_only_verify_rate = 1;
+
+        let _ = parser.compute_mask().unwrap();
+
+        let key = parser.mask_cache_key_for_prefix(&[]);
+        let wrong_mask = parser.tok_trie().singleton_token_set(parser.eos_token);
+        parser.mask_cache.insert(key, wrong_mask);
+
+        let next_mask = parser.compute_mask().unwrap();
+        assert!(
+            !parser.mask_cache_cfg_only_key,
+            "cfg-only mode should auto-disable on verification mismatch"
+        );
+        assert!(
+            next_mask.num_set() > 1,
+            "after auto-disable, parser should recompute a non-trivial permissive mask"
+        );
     }
 }

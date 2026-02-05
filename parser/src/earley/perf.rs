@@ -87,6 +87,8 @@ pub struct ParserPerfCounters {
     pub tokenize_ff: PerfTimer,
     pub compute_bias: PerfTimer,
     pub compute_mask: PerfTimer,
+    #[cfg(feature = "mask_cache")]
+    pub mask_cache_key: PerfTimer,
     pub precompute: PerfTimer,
 }
 
@@ -105,12 +107,15 @@ impl ParserPerfCounters {
             tokenize_ff: PerfTimer::new("tokenize_ff"),
             compute_bias: PerfTimer::new("compute_bias"),
             compute_mask: PerfTimer::new("compute_mask"),
+            #[cfg(feature = "mask_cache")]
+            mask_cache_key: PerfTimer::new("mask_cache_key"),
             precompute: PerfTimer::new("precompute"),
         }
     }
 
     pub fn counters(&self) -> Vec<&PerfTimer> {
-        vec![
+        #[cfg(feature = "mask_cache")]
+        let mut counters = vec![
             &self.force_bytes,
             &self.force_bytes_empty,
             &self.tokenize_ff,
@@ -118,7 +123,20 @@ impl ParserPerfCounters {
             &self.compute_mask,
             &self.tmp_counter,
             &self.precompute,
-        ]
+        ];
+        #[cfg(not(feature = "mask_cache"))]
+        let counters = vec![
+            &self.force_bytes,
+            &self.force_bytes_empty,
+            &self.tokenize_ff,
+            &self.compute_bias,
+            &self.compute_mask,
+            &self.tmp_counter,
+            &self.precompute,
+        ];
+        #[cfg(feature = "mask_cache")]
+        counters.push(&self.mask_cache_key);
+        counters
     }
 }
 
